@@ -79,6 +79,21 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
     registry
 }
 
+/// Point one more provider at a deterministic executable so availability
+/// checks (`ensure_provider_available` — used by `agent.delegate` and by
+/// `agent.setModel`'s cross-provider gate) pass without the real binary on the
+/// test host. Merges into the `providers.paths` map seeded by
+/// [`test_registry_with_default_provider`] rather than replacing it, so
+/// auggie's override survives.
+pub(super) fn seed_provider_path(svc: &Services, provider_id: &str) {
+    let mut paths = svc.effective_settings().providers.paths;
+    paths.insert(provider_id.to_string(), "/bin/sh".to_string());
+    svc.settings_registry()
+        .expect("registry")
+        .apply(&[("providers.paths".into(), json!(paths))])
+        .expect("seed provider path");
+}
+
 pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
     let ts = now_iso();
     Workspace {
@@ -7796,6 +7811,11 @@ async fn set_model_clears_resolved_display_model() {
 #[tokio::test]
 async fn set_model_reconciles_provider_on_cross_provider_switch() {
     let (_t, svc, ws) = setup().await;
+    // The cross-provider gate holds the TARGET provider to the create/delegate
+    // availability bar, so point opencode at a deterministic executable the
+    // same way the shared registry does for auggie — the real binary is not on
+    // the test host.
+    seed_provider_path(&svc, "opencode");
     let id = create_agent(&svc, &ws, "Switch").await;
     // Initial state: auggie provider.
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
@@ -7824,6 +7844,7 @@ async fn set_model_reconciles_provider_on_cross_provider_switch() {
 #[tokio::test]
 async fn set_model_reconciles_provider_after_first_real_use() {
     let (_t, svc, ws) = setup().await;
+    seed_provider_path(&svc, "opencode");
     let id = create_agent(&svc, &ws, "SwitchLate").await;
     svc.store()
         .set_acp_session_id(&ws, &id, "acp-first-use")
@@ -7844,6 +7865,74 @@ async fn set_model_reconciles_provider_after_first_real_use() {
         Some("acp-first-use"),
         "acp session id untouched by the switch"
     );
+}
+
+/// A cross-provider `agent.setModel` holds the TARGET provider to the same
+/// availability bar as the create/delegate front door: switching onto a
+/// provider that is not runnable is rejected `-32602` at the front door
+/// instead of leaving the session parked on a dead provider until the next
+/// turn's spawn fails with a raw binary error. The session is left untouched.
+#[tokio::test]
+async fn set_model_cross_provider_rejects_unavailable_provider() {
+    let (_t, svc, ws) = setup().await;
+    // Deliberately NO `seed_provider_path` for opencode: the target is a
+    // registered provider that is not installed on the test host.
+    let id = create_agent(&svc, &ws, "DeadTarget").await;
+    let before = svc.agent_get_session_op(id.clone()).await.expect("get");
+    let err = svc
+        .agent_set_model_op(
+            id.clone(),
+            "opencode-go/kimi-k3".into(),
+            Some("opencode".into()),
+        )
+        .await
+        .expect_err("switch onto an unavailable provider");
+    assert!(matches!(err, Error::InvalidParams(_)), "got: {err:?}");
+    assert!(
+        err.to_string()
+            .contains("agent.setModel: provider \"opencode\" (OpenCode) is not available"),
+        "availability rejection names the target: {err}"
+    );
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model, before.model, "model must be unchanged");
+    assert_eq!(
+        after.provider, before.provider,
+        "provider must be unchanged"
+    );
+}
+
+/// The availability gate is scoped to a switch that MOVES the session: an
+/// explicit `providerId` naming the provider the session is ALREADY on stays
+/// ungated, so an agent can still change its model while its own provider
+/// fails the availability probe (uninstalled on this host, disabled in
+/// settings after the agent was created).
+#[tokio::test]
+async fn set_model_same_provider_is_not_gated_by_availability() {
+    let (_t, svc, ws) = setup().await;
+    let id = create_agent(&svc, &ws, "SameProvider").await;
+    // Park the session on a provider that is NOT available on this host,
+    // through the narrow writer that owns the `provider` column.
+    svc.store()
+        .set_agent_session_model(
+            &ws,
+            &id,
+            "opencode-go/kimi-k3",
+            Some("opencode"),
+            &now_iso(),
+        )
+        .await
+        .expect("park session on opencode");
+    // Same provider, new model: allowed despite opencode being unavailable.
+    svc.agent_set_model_op(
+        id.clone(),
+        "opencode-go/kimi-k4".into(),
+        Some("opencode".into()),
+    )
+    .await
+    .expect("same-provider model change stays ungated");
+    let after = svc.agent_get_session_op(id).await.expect("get after");
+    assert_eq!(after.model.as_deref(), Some("opencode-go/kimi-k4"));
+    assert_eq!(after.provider.as_deref(), Some("opencode"));
 }
 
 /// `agent.setModel` leaves session.provider unchanged when no explicit
@@ -8487,6 +8576,10 @@ async fn set_model_normalizes_legacy_provider_aliases() {
 #[tokio::test]
 async fn set_model_bare_model_with_explicit_provider_id() {
     let (_t, svc, ws) = setup().await;
+    // The cross-provider switch below runs the availability gate against the
+    // target, so pin claude-code to a deterministic executable rather than
+    // depending on whether the test host happens to have it installed.
+    seed_provider_path(&svc, "claude-code");
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
     let now = crate::model_catalog::ModelCatalogCache::now_ms();
     svc.models_catalog.test_store(
